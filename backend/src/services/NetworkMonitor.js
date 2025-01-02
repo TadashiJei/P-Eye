@@ -1,41 +1,97 @@
 import NetworkDevice from '../models/NetworkDevice.js';
 import NetworkTopology from '../models/NetworkTopology.js';
 import NetworkMetrics from '../models/NetworkMetrics.js';
+import AutoConfigService from './AutoConfigService.js';
+import SelfHealingService from './SelfHealingService.js';
+import PolicyEnforcementService from './PolicyEnforcementService.js';
 import logger from '../utils/logger.js';
 
 class NetworkMonitor {
     // Device Discovery
     static async discoverDevices(subnet) {
         try {
-            // TODO: Implement actual network scanning using nmap or similar
-            // This is a placeholder for the actual implementation
-            logger.info(`Scanning subnet: ${subnet}`);
+            logger.info(`Starting network discovery on subnet: ${subnet}`);
             
-            // Mock discovery results
-            const discoveredDevices = [
-                {
-                    name: 'Router-01',
-                    type: 'router',
-                    interfaces: [{
-                        ipAddress: '192.168.1.1',
-                        type: 'ethernet'
-                    }]
-                }
-                // Add more mock devices as needed
-            ];
-
+            // Use AutoConfigService for device discovery
+            const discoveredDevices = await AutoConfigService.discoverDevices(subnet);
+            
             // Save discovered devices
             const savedDevices = await Promise.all(
-                discoveredDevices.map(device => 
-                    NetworkDevice.create(device)
-                )
+                discoveredDevices.map(async device => {
+                    // Check if device already exists
+                    const existingDevice = await NetworkDevice.findOne({ 
+                        $or: [
+                            { name: device.name },
+                            { macAddress: device.macAddress }
+                        ]
+                    });
+
+                    if (existingDevice) {
+                        // Update existing device
+                        Object.assign(existingDevice, device);
+                        return existingDevice.save();
+                    }
+
+                    // Create new device
+                    return NetworkDevice.create(device);
+                })
             );
+
+            // Trigger auto-configuration for new devices
+            for (const device of savedDevices) {
+                if (device.status === 'discovered') {
+                    try {
+                        const defaultConfig = this._getDefaultConfig(device.type);
+                        await AutoConfigService.deployConfig(device._id, defaultConfig);
+                    } catch (configError) {
+                        logger.error(`Auto-configuration failed for device ${device.name}:`, configError);
+                    }
+                }
+            }
 
             return savedDevices;
         } catch (error) {
             logger.error('Device discovery error:', error);
             throw error;
         }
+    }
+
+    // Helper method to get default configuration based on device type
+    static _getDefaultConfig(deviceType) {
+        const defaultConfigs = {
+            router: {
+                interfaces: [{
+                    name: 'GigabitEthernet0/0',
+                    ip: 'dhcp',
+                    subnet: null
+                }],
+                routing: {
+                    protocol: 'static',
+                    networks: []
+                },
+                security: {
+                    firewallRules: [],
+                    accessLists: []
+                }
+            },
+            switch: {
+                vlans: [{
+                    id: 1,
+                    name: 'default'
+                }],
+                ports: [{
+                    number: 1,
+                    mode: 'access',
+                    vlan: 1
+                }],
+                'spanning-tree': {
+                    mode: 'rapid-pvst',
+                    priority: 32768
+                }
+            }
+        };
+
+        return defaultConfigs[deviceType] || {};
     }
 
     // Topology Mapping
@@ -94,39 +150,68 @@ class NetworkMonitor {
     // Health Check
     static async checkDeviceHealth(deviceId) {
         try {
-            const device = await NetworkDevice.findById(deviceId);
-            if (!device) {
-                throw new Error('Device not found');
+            // Use SelfHealingService for comprehensive health check
+            const healthStatus = await SelfHealingService.runHealthCheck(deviceId);
+            
+            // Check for any critical issues
+            const criticalIssues = this._findCriticalIssues(healthStatus);
+            if (criticalIssues.length > 0) {
+                logger.warn(`Critical issues found for device ${deviceId}:`, criticalIssues);
+                
+                // Attempt automatic recovery
+                const faults = criticalIssues.map(issue => ({
+                    type: issue.category,
+                    severity: 'high',
+                    description: issue.description
+                }));
+                
+                await SelfHealingService.attemptRecovery(deviceId, faults);
             }
 
-            // TODO: Implement actual health checks
-            // This is a placeholder for the actual implementation
-            const healthStatus = {
-                status: 'active',
-                uptime: Math.floor(Math.random() * 1000000),
-                metrics: {
-                    cpu: {
-                        usage: Math.random() * 100,
-                        temperature: 20 + Math.random() * 40
-                    },
-                    memory: {
-                        used: Math.random() * 16000000000,
-                        total: 16000000000
-                    }
-                }
-            };
-
-            device.status = healthStatus.status;
-            device.uptime = healthStatus.uptime;
-            device.metrics = healthStatus.metrics;
-            device.lastSeen = new Date();
-
-            await device.save();
             return healthStatus;
         } catch (error) {
             logger.error('Health check error:', error);
             throw error;
         }
+    }
+
+    // Helper method to identify critical issues
+    static _findCriticalIssues(healthStatus) {
+        const criticalIssues = [];
+
+        // Check connectivity
+        if (!healthStatus.connectivity.isConnected) {
+            criticalIssues.push({
+                category: 'connectivity',
+                description: 'Device is unreachable'
+            });
+        }
+
+        // Check performance metrics
+        if (healthStatus.performance) {
+            healthStatus.performance.forEach(issue => {
+                if (issue.severity === 'high') {
+                    criticalIssues.push({
+                        category: 'performance',
+                        description: issue.description
+                    });
+                }
+            });
+        }
+
+        // Check configuration
+        if (healthStatus.configuration) {
+            healthStatus.configuration.forEach(issue => {
+                if (issue.severity === 'high') {
+                    criticalIssues.push({
+                        category: 'configuration',
+                        description: issue.description
+                    });
+                }
+            });
+        }
+
+        return criticalIssues;
     }
 
     // Alert Generation
@@ -179,11 +264,37 @@ class NetworkMonitor {
                     'warning',
                     `Device ${device.name} is inactive`
                 );
+
+                // Check policy compliance
+                const complianceStatus = await PolicyEnforcementService.checkCompliance(deviceId);
+                if (!complianceStatus.compliant) {
+                    // Handle policy violations
+                    await PolicyEnforcementService.handleViolations(deviceId, complianceStatus.violations);
+                }
             }
 
             return device.status;
         } catch (error) {
             logger.error('Status tracking error:', error);
+            throw error;
+        }
+    }
+
+    // Initialize device monitoring
+    static async initializeDeviceMonitoring(deviceId) {
+        try {
+            // Start policy monitoring
+            await PolicyEnforcementService.monitorCompliance(deviceId);
+
+            // Deploy initial policies
+            await PolicyEnforcementService.deployPolicies(deviceId);
+
+            return {
+                success: true,
+                message: 'Device monitoring initialized successfully'
+            };
+        } catch (error) {
+            logger.error('Device monitoring initialization error:', error);
             throw error;
         }
     }

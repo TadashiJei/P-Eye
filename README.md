@@ -59,7 +59,7 @@ graph TB
 
 1. **Clone the Repository**
 ```bash
-git clone https://github.com/yourusername/eyenet.git
+git clone https://github.com/tadashijei/P-Eye.git
 cd eyenet
 ```
 
